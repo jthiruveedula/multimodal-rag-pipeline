@@ -14,6 +14,7 @@ from google.cloud import bigquery, storage
 from vertexai.language_models import TextEmbeddingModel
 from vertexai.vision_models import MultiModalEmbeddingModel
 import vertexai
+import vertexai.generative_models as genai
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,8 @@ class MultimodalRAGPipeline:
         self.gcs = storage.Client(project=config.project_id)
         self.text_embedder = TextEmbeddingModel.from_pretrained(config.text_model)
         self.mm_embedder = MultiModalEmbeddingModel.from_pretrained(config.multimodal_model)
+        # Pre-instantiate the generative model for better performance in repeated queries
+        self.gen_model = genai.GenerativeModel("gemini-1.5-pro")
         self._ensure_bq_table()
 
     # ------------------------------------------------------------------
@@ -75,10 +78,12 @@ class MultimodalRAGPipeline:
     def ingest_text(self, text: str, source: str, metadata: dict | None = None) -> list[str]:
         """Chunk and embed a text document, store in BigQuery."""
         chunks = self._chunk_text(text)
+        # Batch embed all chunks in a single API call for O(1) network overhead
+        embeddings = self.text_embedder.get_embeddings(chunks)
         rows = []
         ids = []
-        for i, chunk in enumerate(chunks):
-            emb = self.text_embedder.get_embeddings([chunk])[0].values
+        for i, (chunk, emb_obj) in enumerate(zip(chunks, embeddings)):
+            emb = emb_obj.values
             doc_id = f"{source}::chunk_{i}"
             rows.append({
                 "id": doc_id,
@@ -135,14 +140,13 @@ class MultimodalRAGPipeline:
 
     def generate_answer(self, query: str, context_docs: list[dict]) -> str:
         """Build grounded prompt and call Gemini for final answer."""
-        import vertexai.generative_models as genai
         context = "\n\n".join(f"[{d['source']}]\n{d['text']}" for d in context_docs)
         prompt = (
             f"You are a helpful assistant. Use ONLY the context below to answer.\n\n"
             f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"
         )
-        model = genai.GenerativeModel("gemini-1.5-pro")
-        response = model.generate_content(prompt)
+        # Use pre-instantiated model to save latency
+        response = self.gen_model.generate_content(prompt)
         return response.text
 
     def query(self, question: str, modality_filter: str | None = None) -> dict:
